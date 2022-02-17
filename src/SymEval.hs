@@ -162,6 +162,7 @@ currentGas = gets sestFuel
 
 symeval :: (MonadIO m) => Term Var -> SymEvalT m (Term Var)
 symeval t = do
+  liftIO $ putStrLn $ "evaluating: " ++ show (pretty t)
   fuelLeft <- currentGas
   if fuelLeft <= 0
     then return t
@@ -181,9 +182,12 @@ symeval' t@(App hd args) = do
         , unifyLit c' (LitB False) >>= \constr -> learn constr >> consumeGas (symeval e)
         ]
     Free BinFix -> do
-      let [f] = args
-      consumeGas (symeval $ f `app` App (Free BinFix) [f])
+      let (f:rest) = args
+      consumeGas (symeval $ f `appN` (App (Free BinFix) [f] : rest))
+    Free _ ->
+      App hd <$> mapM symeval args
     _ -> return t
+
 
 unifyLit :: (Monad m) => Term Var -> Lit -> SymEvalT m Constraint
 unifyLit (App (Symb s) []) l = return $ s :== App (Literal l) []
