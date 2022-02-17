@@ -67,7 +67,7 @@ path x st = Path
   }
 
 -- | Our default solver; maybe this should become a type-level parm too...
-type Sol = CVC4_DBG
+type Sol = CVC4
 
 -- | A 'SymEvalT' is equivalent to a function with type:
 --
@@ -162,7 +162,6 @@ currentGas = gets sestFuel
 
 symeval :: (MonadIO m) => Term Var -> SymEvalT m (Term Var)
 symeval t = do
-  liftIO $ putStrLn $ "evaluating: " ++ show (pretty t)
   fuelLeft <- currentGas
   if fuelLeft <= 0
     then return t
