@@ -1,0 +1,38 @@
+verbatim:
+  cabal-version: 2.4
+
+name: symeval-experiment
+version: 0.0.0
+extra-source-files:
+  - LICENSE
+
+dependencies:
+  - base >= 4.9 && < 5
+  - mtl >= 2.2.2
+  - bytestring
+  - text
+  - containers
+  - optparse-applicative
+  - megaparsec
+  - QuickCheck
+  - prettyprinter
+  - list-t
+  - simple-smt
+
+library:
+  source-dirs: src
+
+executable:
+  main: Main.hs
+  source-dirs: executable
+  dependencies:
+    - symeval-experiment
+
+tests:
+  spec:
+    main: Spec.hs
+    source-dirs:
+      - tests
+    dependencies:
+      - symeval-experiment
+
