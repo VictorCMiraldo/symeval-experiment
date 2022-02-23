@@ -27,6 +27,7 @@ import Data.Void
 import SymEval.Term
 import Prettyprinter hiding (Pretty, pretty)
 import Data.List (intersperse)
+import GHC.IO.Unsafe (unsafePerformIO)
 
 -- | SMT Constraints:
 data Constraint
@@ -61,6 +62,26 @@ andConstr (And l) (And m) = And (l ++ m)
 andConstr (And l) y = And (y : l)
 andConstr x (And m) = And (x : m)
 andConstr x y = And [x, y]
+
+{-# NOINLINE solve #-}
+solve :: M.Map String Type -> Constraint -> Bool
+solve = unsafePerformIO $ do
+  solver <- cvc4_ALL_SUPPORTED True
+  runSolverWith solver $ declareVariables (M.fromList [("lalala", TyBool)])
+  return $ \ env c -> unsafePerformIO $ runSolverWith solver $ do
+    solverPush
+    declareVariables env
+    assert env c
+    res <- checkSat
+    solverPop
+    return $ case res of
+      SimpleSMT.Unsat -> False
+      _ -> True
+
+
+runSolverWith :: (MonadIO m) => SimpleSMT.Solver -> SolverT s m a -> m a
+runSolverWith solver (SolverT comp) = runReaderT comp solver
+
 
 -- | Solver monad for a specific solver, passed as a phantom type variable @s@ (refer to 'IsSolver' for more)
 --  to know the supported solvers. That's a phantom type variable used only to distinguish
@@ -171,7 +192,7 @@ instance IsSolver CVC4 where
 
 -- | Prepare a CVC4 solver with all supported theories, which is necessary
 -- to handle datatypes. The boolean parameter controls debug messages.
-cvc4_ALL_SUPPORTED :: MonadIO m => Bool -> m SimpleSMT.Solver
+cvc4_ALL_SUPPORTED :: (MonadIO m) => Bool -> m SimpleSMT.Solver
 cvc4_ALL_SUPPORTED dbg = do
   -- This generates a "Solver" which logs every interaction it has.
   -- To suppress this logging, replace the 2 next lines by

@@ -66,79 +66,59 @@ path x st = Path
   , pathResult = x
   }
 
--- | Our default solver; maybe this should become a type-level parm too...
-type Sol = CVC4
-
 -- | A 'SymEvalT' is equivalent to a function with type:
 --
--- > SymEvalSt -> SMT.Solver -> m [(a, SymEvalSt)]
-newtype SymEvalT m a = SymEvalT {symEvalT :: StateT SymEvalSt (SolverT Sol (ListT m)) a}
+-- > SymEvalSt -> SMT. -> m [(a, SymEvalSt)]
+newtype SymEvalT m a = SymEvalT {symEvalT :: StateT SymEvalSt (ListT m) a}
   deriving (Functor)
   deriving newtype (Applicative, Monad, MonadState SymEvalSt)
 
-symevalT :: (MonadIO m) => SymEvalT m a -> m [Path a]
+symevalT :: (Monad m) => SymEvalT m a -> m [Path a]
 symevalT = runSymEvalT st0
   where
     st0 = SymEvalSt mempty M.empty 0 10 False
 
-runSymEvalTRaw :: (Monad m) => SymEvalSt -> SymEvalT m a -> SolverT Sol (ListT m) (a, SymEvalSt)
+runSymEvalTRaw :: (Monad m) => SymEvalSt -> SymEvalT m a -> ListT m (a, SymEvalSt)
 runSymEvalTRaw st = flip runStateT st . symEvalT
 
 -- |Running a symbolic execution will prepare the solver only once, then use a persistent session
 -- to make all the necessary queries.
-runSymEvalT :: (MonadIO m) => SymEvalSt -> SymEvalT m a -> m [Path a]
-runSymEvalT st = ListT.toList . fmap (uncurry path) . runSolverT . runSymEvalTRaw st
+runSymEvalT :: (Monad m) => SymEvalSt -> SymEvalT m a -> m [Path a]
+runSymEvalT st = ListT.toList . fmap (uncurry path) . runSymEvalTRaw st
 
 instance (Monad m) => Alternative (SymEvalT m) where
   empty = SymEvalT $ StateT $ const empty
   xs <|> ys = SymEvalT $ StateT $ \st -> runSymEvalTRaw st xs <|> runSymEvalTRaw st ys
 
 instance MonadTrans SymEvalT where
-  lift = SymEvalT . lift . lift . lift
+  lift = SymEvalT . lift . lift
 
 instance (MonadFail m) => MonadFail (SymEvalT m) where
   fail = lift . fail
 
-instance (MonadIO m) => MonadIO (SymEvalT m) where
-  liftIO = lift . liftIO
-
 -- |Prune the set of paths in the current set.
-prune :: forall m a . (MonadIO m) => SymEvalT m a -> SymEvalT m a
+prune :: forall m a . (Monad m) => SymEvalT m a -> SymEvalT m a
 prune xs = SymEvalT $ StateT $ \st -> do
     (x, st') <- runSymEvalTRaw st xs
-    ok <- pathIsPlausible st'
-    guard ok
+    guard $ solve (sestGamma st') (sestConstraint st')
     return (x, st')
-  where
-    pathIsPlausible :: (MonadIO n, MonadFail n) => SymEvalSt -> SolverT Sol n Bool
-    pathIsPlausible env
-      | sestValidated env = return True -- We already validated this branch before; nothing new was learnt.
-      | otherwise = do
-        solverPush
-        declareVariables (sestGamma env)
-        assert (sestGamma env) (sestConstraint env)
-        res <- checkSat
-        solverPop
-        return $ case res of
-          SimpleSMT.Unsat -> False
-          _ -> True
 
 -- |Learn a new constraint and add it as a conjunct to the set of constraints of
 -- the current path. Make sure that this branch gets marked as /not/ validated, regardless
 -- of whether or not we had already validated it before.
-learn :: (MonadIO m) => Constraint -> SymEvalT m ()
+learn :: (Monad m) => Constraint -> SymEvalT m ()
 learn c = modify (\st -> st { sestConstraint = c <> sestConstraint st, sestValidated = False })
 
-declSymVars :: (MonadIO m) => [(String, Type)] -> SymEvalT m [String]
+declSymVars :: (Monad m) => [(String, Type)] -> SymEvalT m [String]
 declSymVars vs = do
   old <- get
   modify (\st -> st { sestGamma = M.union (sestGamma st) (M.fromList vs) })
   return $ map fst vs
 
-freshSymVar :: (MonadIO m) => Type -> SymEvalT m String
+freshSymVar :: (Monad m) => Type -> SymEvalT m String
 freshSymVar ty = head <$> freshSymVars [ty]
 
-freshSymVars :: (MonadIO m) => [Type] -> SymEvalT m [String]
+freshSymVars :: (Monad m) => [Type] -> SymEvalT m [String]
 freshSymVars [] = return []
 freshSymVars tys = do
   let n = length tys
@@ -147,27 +127,26 @@ freshSymVars tys = do
   let vars = zipWith (\i ty -> ("sv" ++ show i , ty)) [ctr..] tys
   declSymVars vars
 
-runEvaluation :: (MonadIO m) => Term Var -> SymEvalT m (Term Var)
+runEvaluation :: (Monad m) => Term Var -> SymEvalT m (Term Var)
 runEvaluation t = do
-  liftIO $ putStrLn $ "evaluating: " ++ show (pretty t)
   let (lams, body) = getHeadLams t
   svars <- freshSymVars lams
   symeval (appN t $ map (var . Symb) svars)
 
-consumeGas :: (MonadIO m) => SymEvalT m a -> SymEvalT m a
+consumeGas :: (Monad m) => SymEvalT m a -> SymEvalT m a
 consumeGas f = modify (\st -> st { sestFuel = sestFuel st - 1 }) >> f
 
-currentGas :: (MonadIO m) => SymEvalT m Int
+currentGas :: (Monad m) => SymEvalT m Int
 currentGas = gets sestFuel
 
-symeval :: (MonadIO m) => Term Var -> SymEvalT m (Term Var)
+symeval :: (Monad m) => Term Var -> SymEvalT m (Term Var)
 symeval t = do
   fuelLeft <- currentGas
   if fuelLeft <= 0
     then return t
     else prune $ symeval' t
 
-symeval' :: (MonadIO m) => Term Var -> SymEvalT m (Term Var)
+symeval' :: (Monad m) => Term Var -> SymEvalT m (Term Var)
 symeval' t@(Lam ty body) = do
   svar <- freshSymVar ty
   symeval' $ t `app` var (Symb svar)
@@ -207,7 +186,7 @@ instance Pretty PathStatus where
   pretty Completed = "Completed"
   pretty OutOfFuel = "OutOfFuel"
 
-runFor :: (MonadIO m) => Term Var -> m ()
+runFor :: Term Var -> IO ()
 runFor t = do
   paths <- symevalT (runEvaluation t)
-  mapM_ (liftIO . print . pretty) paths
+  mapM_ (print . pretty) paths
