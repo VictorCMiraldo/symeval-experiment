@@ -31,6 +31,7 @@ data Lit
 data Builtin
   = BinAdd
   | BinSub
+  | BinMul
   | BinLeq
   | BinEq
   | BinIf
@@ -162,6 +163,7 @@ instance Pretty Lit where
 instance Pretty Builtin where
   pretty BinAdd = "add"
   pretty BinSub = "sub"
+  pretty BinMul = "mul"
   pretty BinLeq = "leq"
   pretty BinEq = "eq"
   pretty BinIf = "if"

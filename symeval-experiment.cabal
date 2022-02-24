@@ -31,6 +31,7 @@ library
     , megaparsec
     , mtl >=2.2.2
     , optparse-applicative
+    , parallel
     , prettyprinter
     , simple-smt
     , text
@@ -42,6 +43,7 @@ executable symeval-experiment
       Paths_symeval_experiment
   hs-source-dirs:
       executable
+  ghc-options: -threaded
   build-depends:
       QuickCheck
     , base >=4.9 && <5
@@ -51,6 +53,7 @@ executable symeval-experiment
     , megaparsec
     , mtl >=2.2.2
     , optparse-applicative
+    , parallel
     , prettyprinter
     , simple-smt
     , symeval-experiment
@@ -73,6 +76,7 @@ test-suite spec
     , megaparsec
     , mtl >=2.2.2
     , optparse-applicative
+    , parallel
     , prettyprinter
     , simple-smt
     , symeval-experiment

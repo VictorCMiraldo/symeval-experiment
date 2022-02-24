@@ -69,38 +69,39 @@ path x st = Path
 -- | A 'SymEvalT' is equivalent to a function with type:
 --
 -- > SymEvalSt -> SMT. -> m [(a, SymEvalSt)]
-newtype SymEvalT m a = SymEvalT {symEvalT :: StateT SymEvalSt (ListT m) a}
+newtype SymEvalT m a = SymEvalT {symEvalT :: ReaderT Solver (StateT SymEvalSt (ListT m)) a}
   deriving (Functor)
   deriving newtype (Applicative, Monad, MonadState SymEvalSt)
 
 symevalT :: (Monad m) => SymEvalT m a -> m [Path a]
-symevalT = runSymEvalT st0
+symevalT = runSymEvalT mySolver st0
   where
     st0 = SymEvalSt mempty M.empty 0 10 False
+    mySolver = solve "runSymEvalTRaw"
 
-runSymEvalTRaw :: (Monad m) => SymEvalSt -> SymEvalT m a -> ListT m (a, SymEvalSt)
-runSymEvalTRaw st = flip runStateT st . symEvalT
+runSymEvalTRaw :: (Monad m) => Solver -> SymEvalSt -> SymEvalT m a -> ListT m (a, SymEvalSt)
+runSymEvalTRaw s st = flip runStateT st . flip runReaderT s . symEvalT
 
 -- |Running a symbolic execution will prepare the solver only once, then use a persistent session
 -- to make all the necessary queries.
-runSymEvalT :: (Monad m) => SymEvalSt -> SymEvalT m a -> m [Path a]
-runSymEvalT st = ListT.toList . fmap (uncurry path) . runSymEvalTRaw st
+runSymEvalT :: (Monad m) => Solver -> SymEvalSt -> SymEvalT m a -> m [Path a]
+runSymEvalT s st = ListT.toList . fmap (uncurry path) . runSymEvalTRaw s st
 
 instance (Monad m) => Alternative (SymEvalT m) where
-  empty = SymEvalT $ StateT $ const empty
-  xs <|> ys = SymEvalT $ StateT $ \st -> runSymEvalTRaw st xs <|> runSymEvalTRaw st ys
+  empty = SymEvalT $ ReaderT $ \_ -> StateT $ const empty
+  xs <|> ys = SymEvalT $ ReaderT $ \ s -> StateT $ \st -> runSymEvalTRaw s st xs <|> runSymEvalTRaw s st ys
 
 instance MonadTrans SymEvalT where
-  lift = SymEvalT . lift . lift
+  lift = SymEvalT . lift . lift . lift
 
 instance (MonadFail m) => MonadFail (SymEvalT m) where
   fail = lift . fail
 
 -- |Prune the set of paths in the current set.
 prune :: forall m a . (Monad m) => SymEvalT m a -> SymEvalT m a
-prune xs = SymEvalT $ StateT $ \st -> do
-    (x, st') <- runSymEvalTRaw st xs
-    guard $ solve (sestGamma st') (sestConstraint st')
+prune xs = SymEvalT $ ReaderT $ \s -> StateT $ \st -> do
+    (x, st') <- runSymEvalTRaw s st xs
+    guard $ s (sestGamma st') (sestConstraint st')
     return (x, st')
 
 -- |Learn a new constraint and add it as a conjunct to the set of constraints of

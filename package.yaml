@@ -18,6 +18,7 @@ dependencies:
   - prettyprinter
   - list-t
   - simple-smt
+  - parallel
 
 library:
   source-dirs: src
@@ -25,6 +26,7 @@ library:
 executable:
   main: Main.hs
   source-dirs: executable
+  ghc-options: -threaded
   dependencies:
     - symeval-experiment
 

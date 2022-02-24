@@ -15,6 +15,7 @@ module SymEval.Solver where
 import Control.Arrow ((***))
 import Control.Monad.IO.Class
 import Control.Monad.Reader
+import Control.Concurrent.MVar
 import Data.Bifunctor (bimap)
 import qualified Data.Map as M
 import Data.Maybe (mapMaybe)
@@ -22,12 +23,14 @@ import qualified SimpleSMT
 import Control.Monad.State.Class
 import Control.Monad.Error.Class
 import Control.Applicative
+import Control.Parallel
 import SymEval.Pretty
 import Data.Void
 import SymEval.Term
 import Prettyprinter hiding (Pretty, pretty)
 import Data.List (intersperse)
 import GHC.IO.Unsafe (unsafePerformIO)
+import Control.Exception (evaluate)
 
 -- | SMT Constraints:
 data Constraint
@@ -63,21 +66,25 @@ andConstr (And l) y = And (y : l)
 andConstr x (And m) = And (x : m)
 andConstr x y = And [x, y]
 
-{-# NOINLINE solve #-}
-solve :: M.Map String Type -> Constraint -> Bool
-solve = unsafePerformIO $ do
-  solver <- cvc4_ALL_SUPPORTED True
-  runSolverWith solver $ declareVariables (M.fromList [("lalala", TyBool)])
-  return $ \ env c -> unsafePerformIO $ runSolverWith solver $ do
-    solverPush
-    declareVariables env
-    assert env c
-    res <- checkSat
-    solverPop
-    return $ case res of
-      SimpleSMT.Unsat -> False
-      _ -> True
+type Solver = M.Map String Type -> Constraint -> Bool
 
+{-# NOINLINE solve #-}
+solve :: String -> Solver
+solve v = unsafePerformIO $ do
+  solver <- cvc4_ALL_SUPPORTED True
+  runSolverWith solver $ declareVariables (M.fromList [(v, TyBool)])
+  mv <- evaluate solver >>= newMVar
+  return $ \ env c -> unsafePerformIO $ do
+    withMVar mv $ \safeSolver -> do
+     runSolverWith safeSolver $ do
+       solverPush
+       declareVariables env
+       assert env c
+       res <- checkSat
+       solverPop
+       return $ case res of
+         SimpleSMT.Unsat -> False
+         _ -> True
 
 runSolverWith :: (MonadIO m) => SimpleSMT.Solver -> SolverT s m a -> m a
 runSolverWith solver (SolverT comp) = runReaderT comp solver
@@ -228,6 +235,7 @@ translateType (TyFun _ _) = fail "tranlsateType: translating a TyFun"
 translateBuiltin :: (MonadFail m) => Builtin -> [SimpleSMT.SExpr] -> m SimpleSMT.SExpr
 translateBuiltin BinAdd [x, y] = return $ SimpleSMT.add x y
 translateBuiltin BinSub [x, y] = return $ SimpleSMT.sub x y
+translateBuiltin BinMul [x, y] = return $ SimpleSMT.mul x y
 translateBuiltin BinLeq [x, y] = return $ SimpleSMT.leq x y
 translateBuiltin BinEq  [x, y] = return $ SimpleSMT.eq x y
 translateBuiltin BinIf  [x, y, z] = return $ SimpleSMT.ite x y z
