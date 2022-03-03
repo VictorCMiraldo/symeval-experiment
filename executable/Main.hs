@@ -3,6 +3,7 @@ module Main where
 import GHC.IO.Encoding
 
 import SymEval
+import SymEval.Solver
 import SymEval.Term
 
 -- smart constructors for builtin terms:
@@ -38,4 +39,28 @@ fib = fix $ Lam (TyFun TyInteger TyInteger) $ Lam TyInteger $
 main :: IO ()
 main = do
   setLocaleEncoding utf8
-  runFor fib
+  runFor
+    [("x", TyInteger)]
+    fib
+    (OutCond
+      (\t ->
+        And
+        [ -- The condition on the output we are interested in.
+          Eq
+            (App (Free BinLeq) [t, App (Free BinAdd) [var (Symb "x"), var (Symb "x")]])
+            (var (Literal (LitB True)))
+        , -- The condition to limit unrolling.
+          Eq
+            (App (Free BinLeq) [var (Symb "x"), var $ Literal (LitI 6)])
+            (var (Literal (LitB True)))
+        ]
+      )
+    )
+    (InCond
+      (And
+          [ Eq
+            (App (Free BinLeq) [var (Symb "x"), var $ Literal (LitI 2)])
+            (var (Literal (LitB True)))
+          ]
+      )
+    )

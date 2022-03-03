@@ -21,12 +21,14 @@ dependencies:
 
 library:
   source-dirs: src
+  ghc-options: -Wall
 
 executable:
   main: Main.hs
   source-dirs: executable
   dependencies:
     - symeval-experiment
+  ghc-options: -Wall
 
 tests:
   spec:

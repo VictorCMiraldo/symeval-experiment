@@ -1,10 +1,7 @@
 {-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MonoLocalBinds #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -16,20 +13,12 @@
 module SymEval where
 
 import Control.Applicative
-import Control.Arrow (first)
 import Control.Monad
 import Control.Monad.Except
-import Control.Monad.Identity
-import Control.Monad.Reader
 import Control.Monad.State
-import Data.Data hiding (eqT)
 import Data.Foldable
-import Data.Functor
-import Data.List (foldl', intersperse)
-import qualified Data.Map as Map
-import qualified Data.Map.Strict as M
+import qualified Data.Map.Strict as Map
 import Prettyprinter hiding (Pretty (..))
-import Data.Void (absurd)
 import ListT (ListT)
 import qualified ListT
 
@@ -42,7 +31,7 @@ data PathStatus = Completed | OutOfFuel
 
 data Path res = Path
   { pathConstraint :: Constraint,
-    pathGamma :: M.Map String Type,
+    pathGamma :: Map.Map String Type,
     pathStatus :: PathStatus,
     pathResult :: res
   }
@@ -50,7 +39,7 @@ data Path res = Path
 
 data SymEvalSt = SymEvalSt
   { sestConstraint :: Constraint,
-    sestGamma :: M.Map String Type,
+    sestGamma :: Map.Map String Type,
     sestFreshCounter :: Int,
     sestFuel :: Int,
     -- |A branch that has been validated before is never validated again /unless/ we 'learn' something new.
@@ -79,7 +68,7 @@ newtype SymEvalT m a = SymEvalT {symEvalT :: StateT SymEvalSt (SolverT Sol (List
 symevalT :: (MonadIO m) => SymEvalT m a -> m [Path a]
 symevalT = runSymEvalT st0
   where
-    st0 = SymEvalSt mempty M.empty 0 10 False
+    st0 = SymEvalSt mempty Map.empty 0 10 False
 
 runSymEvalTRaw :: (Monad m) => SymEvalSt -> SymEvalT m a -> SolverT Sol (ListT m) (a, SymEvalSt)
 runSymEvalTRaw st = flip runStateT st . symEvalT
@@ -96,11 +85,46 @@ instance (Monad m) => Alternative (SymEvalT m) where
 instance MonadTrans SymEvalT where
   lift = SymEvalT . lift . lift . lift
 
-instance (MonadFail m) => MonadFail (SymEvalT m) where
-  fail = lift . fail
-
 instance (MonadIO m) => MonadIO (SymEvalT m) where
   liftIO = lift . liftIO
+
+pathIsPlausible :: (MonadIO m) => SymEvalSt -> SolverT Sol m Bool
+pathIsPlausible env
+  | sestValidated env = return True -- We already validated this branch before; nothing new was learnt.
+  | otherwise = do
+      solverPush
+      decl <- runExceptT (declareVariables (sestGamma env))
+      case decl of
+        Right _ -> return ()
+        Left s -> error s
+      void $ assert (sestConstraint env)
+      res <- checkSat
+      solverPop
+      return $ case res of
+        SimpleSMT.Unsat -> False
+        _ -> True
+
+checkProperty :: (MonadIO m) => Constraint -> Constraint -> SymEvalSt -> SolverT Sol m SimpleSMT.Result
+checkProperty cOut cIn env = do
+  solverPush
+  decl <- runExceptT (declareVariables (sestGamma env))
+  case decl of
+    Right _ -> return ()
+    Left s -> error s
+  b1 <- assert (sestConstraint env)
+  b2 <- assert cOut
+  b3 <- assertNot cIn
+  result <- checkSat
+  solverPop
+  case result of
+    SimpleSMT.Sat ->
+      if b1 && b2 && b3
+      then return SimpleSMT.Sat
+      -- If a partial translation of the constraint is SAT,
+      -- it does not guarantee us that the full set of constraints is satisfiable.
+      else return SimpleSMT.Unknown
+    _ -> return result
+
 
 -- |Prune the set of paths in the current set.
 prune :: forall m a . (MonadIO m) => SymEvalT m a -> SymEvalT m a
@@ -109,19 +133,18 @@ prune xs = SymEvalT $ StateT $ \st -> do
     ok <- pathIsPlausible st'
     guard ok
     return (x, st')
-  where
-    pathIsPlausible :: (MonadIO n, MonadFail n) => SymEvalSt -> SolverT Sol n Bool
-    pathIsPlausible env
-      | sestValidated env = return True -- We already validated this branch before; nothing new was learnt.
-      | otherwise = do
-        solverPush
-        declareVariables (sestGamma env)
-        assert (sestGamma env) (sestConstraint env)
-        res <- checkSat
-        solverPop
-        return $ case res of
-          SimpleSMT.Unsat -> False
-          _ -> True
+
+-- | Prune the set of paths in the current set.
+pruneAndValidate :: forall m . (MonadIO m) => Constraint -> Constraint -> SymEvalT m Bool
+pruneAndValidate cOut cIn =
+  SymEvalT $ StateT $ \st -> do
+    pathOk <- pathIsPlausible st
+    guard pathOk
+    contradictProperty <- checkProperty cOut cIn st
+    case contradictProperty of
+      SimpleSMT.Unsat -> empty
+      SimpleSMT.Sat -> return (False, st)
+      SimpleSMT.Unknown -> return (True, st)
 
 -- |Learn a new constraint and add it as a conjunct to the set of constraints of
 -- the current path. Make sure that this branch gets marked as /not/ validated, regardless
@@ -131,8 +154,7 @@ learn c = modify (\st -> st { sestConstraint = c <> sestConstraint st, sestValid
 
 declSymVars :: (MonadIO m) => [(String, Type)] -> SymEvalT m [String]
 declSymVars vs = do
-  old <- get
-  modify (\st -> st { sestGamma = M.union (sestGamma st) (M.fromList vs) })
+  modify (\st -> st { sestGamma = Map.union (sestGamma st) (Map.fromList vs) })
   return $ map fst vs
 
 freshSymVar :: (MonadIO m) => Type -> SymEvalT m String
@@ -150,12 +172,12 @@ freshSymVars tys = do
 runEvaluation :: (MonadIO m) => Term Var -> SymEvalT m (Term Var)
 runEvaluation t = do
   liftIO $ putStrLn $ "evaluating: " ++ show (pretty t)
-  let (lams, body) = getHeadLams t
+  let (lams, _) = getHeadLams t
   svars <- freshSymVars lams
   symeval (appN t $ map (var . Symb) svars)
 
-consumeGas :: (MonadIO m) => SymEvalT m a -> SymEvalT m a
-consumeGas f = modify (\st -> st { sestFuel = sestFuel st - 1 }) >> f
+consumeGas :: (MonadIO m) => SymEvalT m ()
+consumeGas = modify (\st -> st { sestFuel = sestFuel st - 1 })
 
 currentGas :: (MonadIO m) => SymEvalT m Int
 currentGas = gets sestFuel
@@ -168,36 +190,94 @@ symeval t = do
     else prune $ symeval' t
 
 symeval' :: (MonadIO m) => Term Var -> SymEvalT m (Term Var)
-symeval' t@(Lam ty body) = do
+symeval' t@(Lam ty _) = do
   svar <- freshSymVar ty
   symeval' $ t `app` var (Symb svar)
-symeval' t@(App hd args) = do
+symeval' u@(App hd args) = do
   case hd of
     Free BinIf -> do
       let [c, t, e] = args
       c' <- symeval' c
       asum
-        [ unifyLit c' (LitB True) >>= \constr -> learn constr >> consumeGas (symeval t)
-        , unifyLit c' (LitB False) >>= \constr -> learn constr >> consumeGas (symeval e)
+        [ do
+            constr <- unifyLit c' (LitB True)
+            learn constr
+            consumeGas
+            symeval t
+        , do
+            constr <- unifyLit c' (LitB False)
+            learn constr
+            consumeGas
+            symeval e
         ]
     Free BinFix -> do
       let (f:rest) = args
-      consumeGas (symeval $ f `appN` (App (Free BinFix) [f] : rest))
+      consumeGas
+      symeval $ f `appN` (App (Free BinFix) [f] : rest)
     Free _ ->
       App hd <$> mapM symeval args
-    _ -> return t
+    _ -> return u
 
+newtype OutCond = OutCond (Term Var -> Constraint)
+newtype InCond = InCond Constraint
+
+data EvaluationWitness =
+  Verified | CounterExample (Term Var)
+
+runConditionalEval :: (MonadIO m) => Term Var -> OutCond -> InCond -> SymEvalT m EvaluationWitness
+runConditionalEval t (OutCond q) (InCond p) = do
+  liftIO $ putStrLn $ "Conditionally evaluating: " ++ show (pretty t)
+  conditionalEval t q p
+
+conditionalEval :: (MonadIO m) => Term Var -> (Term Var -> Constraint) -> Constraint -> SymEvalT m EvaluationWitness
+conditionalEval t outCond inCond = do
+  toEvaluateMore <- pruneAndValidate (outCond t) inCond
+  if toEvaluateMore
+  then do
+    t' <- symEvalOneStep t
+    conditionalEval t' outCond inCond
+  else
+    return (CounterExample t)
+
+symEvalOneStep :: (MonadIO m) => Term Var -> SymEvalT m (Term Var)
+symEvalOneStep t =
+  case t of
+    App v args -> case v of
+      Free BinFix -> do
+        let (f:rest) = args
+        return (f `appN` (App (Free BinFix) [f] : rest))
+      Free BinIf -> do
+        let [cond, caseT, caseF] = args
+        cond' <- symEvalOneStep cond
+        if cond == cond'
+        then
+          asum
+            [ do
+                constr <- unifyLit cond (LitB True)
+                learn constr
+                return caseT
+            , do
+                constr <- unifyLit cond (LitB False)
+                learn constr
+                return caseF
+            ]
+        else
+          return $ App (Free BinIf) [cond', caseT, caseF]
+      _ -> App v <$> mapM symEvalOneStep args
+    Lam ty _ -> do
+      svar <- freshSymVar ty
+      Lam ty <$> symEvalOneStep (t `app` var (Symb svar))
 
 unifyLit :: (Monad m) => Term Var -> Lit -> SymEvalT m Constraint
-unifyLit (App (Symb s) []) l = return $ s :== App (Literal l) []
+unifyLit (App (Symb s) []) l = return $ And [s :== App (Literal l) []]
 unifyLit (App (Literal l') []) l = guard (l' == l) >> return mempty
-unifyLit t l = return (Eq t (App (Literal l) []))
+unifyLit t l = return $ And [Eq t (App (Literal l) [])]
 
 --- TMP CODE
 
 instance (Pretty a) => Pretty (Path a) where
   pretty (Path conds gamma ps res) =
-    vsep [ "With:" <+> pretty (M.toList gamma)
+    vsep [ "With:" <+> pretty (Map.toList gamma)
          , "If:" <+> indent 2 (pretty conds)
          , "Status:" <+> pretty ps
          , "Result:" <+> indent 2 (pretty res)
@@ -207,7 +287,14 @@ instance Pretty PathStatus where
   pretty Completed = "Completed"
   pretty OutOfFuel = "OutOfFuel"
 
-runFor :: (MonadIO m) => Term Var -> m ()
-runFor t = do
-  paths <- symevalT (runEvaluation t)
+instance Pretty EvaluationWitness where
+  pretty Verified = "Verified"
+  pretty (CounterExample t) = "COUNTER-EXAMPLE: The result is" <+> pretty t
+
+runFor :: (MonadIO m) => [(String, Type)] -> Term Var -> OutCond -> InCond -> m ()
+runFor args t outCond inCond = do
+  paths <- symevalT $ do
+    argNames <- declSymVars args
+    let tApplied = t `appN` map (var . Symb) argNames
+    runConditionalEval tApplied outCond inCond
   mapM_ (liftIO . print . pretty) paths

@@ -1,5 +1,4 @@
 {-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -52,7 +51,7 @@ data Term v
 -- |Binary application reduces terms if necessary
 app :: (IsVar v) => Term v -> Term v -> Term v
 app (App n xs) u = App n (xs ++ [u])
-app (Lam ty t) u = subst (singleSub u) t
+app (Lam _  t) u = subst (singleSub u) t
 
 appN :: (IsVar v) => Term v -> [Term v] -> Term v
 appN = foldl' app
@@ -146,7 +145,7 @@ instance Pretty Type where
 instance (Pretty v) => Pretty (Term v) where
   prettyPrec d (App n args) = prettyPrecApp d n args align
   prettyPrec d t@Lam {} = parensIf (d > 10) $ assoclBinder "λ" isLam d t
-    where isLam (Lam ty t) = Just (ty, t)
+    where isLam (Lam ty u) = Just (ty, u)
           isLam _ = Nothing
 
 instance Pretty Var where
