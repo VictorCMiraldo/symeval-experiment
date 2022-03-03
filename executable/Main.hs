@@ -3,6 +3,7 @@ module Main where
 import GHC.IO.Encoding
 
 import SymEval
+import SymEval.Solver
 import SymEval.Term
 
 -- smart constructors for builtin terms:
@@ -26,16 +27,45 @@ litI :: Integer -> Term Var
 litI = flip App [] . Literal . LitI
 
 fib :: Term Var
-fib = fix $ Lam (TyFun TyInteger TyInteger) $ Lam TyInteger $
-  let n = var $ Bound 0
-      f = Bound 1
-   in ite (n .== litI 0)
-          (litI 1)
-          (ite (n .== litI 1)
-               (litI 1)
-               (add (App f [sub n (litI 1)]) (App f [sub n (litI 2)])))
+fib =
+  Lam TyInteger $
+    App (Free BinFix)
+      [ Lam (TyFun TyInteger TyInteger) $ Lam TyInteger $
+        let n = var $ Bound 0
+            f = Bound 1
+        in ite (n .== litI 0)
+                (litI 1)
+                (ite (n .== litI 1)
+                    (litI 1)
+                    (add (App f [sub n (litI 1)]) (App f [sub n (litI 2)]))),
+        var (Bound 0)
+      ]
 
 main :: IO ()
 main = do
   setLocaleEncoding utf8
-  runFor fib
+  runFor
+    [("x", TyInteger)]
+    fib
+    (OutCond
+      (\t ->
+        And
+        [ -- The condition on the output we are interested in.
+          Eq
+            (App (Free BinLeq) [t, App (Free BinAdd) [var (Symb "x"), var (Symb "x")]])
+            (var (Literal (LitB True)))
+        , -- The condition to limit unrolling.
+          Eq
+            (App (Free BinLeq) [var (Symb "x"), var $ Literal (LitI 6)])
+            (var (Literal (LitB True)))
+        ]
+      )
+    )
+    (InCond
+      (And
+          [ Eq
+            (App (Free BinLeq) [var (Symb "x"), var $ Literal (LitI 2)])
+            (var (Literal (LitB True)))
+          ]
+      )
+    )

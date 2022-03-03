@@ -9,19 +9,18 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE FlexibleContexts #-}
 
 module SymEval.Solver where
 
-import Control.Arrow ((***))
 import Control.Monad.IO.Class
 import Control.Monad.Reader
-import Data.Bifunctor (bimap)
 import qualified Data.Map as M
-import Data.Maybe (mapMaybe)
 import qualified SimpleSMT
 import Control.Monad.State.Class
-import Control.Monad.Error.Class
+import Control.Monad.Except
 import Control.Applicative
+import Data.Either
 import SymEval.Pretty
 import Data.Void
 import SymEval.Term
@@ -29,24 +28,26 @@ import Prettyprinter hiding (Pretty, pretty)
 import Data.List (intersperse)
 
 -- | SMT Constraints:
-data Constraint
+data AtomicConstraint
   = String :== Term Var
   | Eq (Term Var) (Term Var)
-  | And [Constraint]
-  | Bottom
   deriving (Eq , Show)
 
-instance  Pretty Constraint where
+data Constraint = And [AtomicConstraint] | Bottom
+
+instance  Pretty AtomicConstraint where
   pretty (n :== term) =
     pretty n <+> "↦" <+> pretty term
   pretty (Eq t u) =
     pretty t <+> "==" <+> pretty u
-  pretty Bottom =
-    "⊥"
+
+instance Pretty Constraint where
   pretty (And []) =
     "⊤"
   pretty (And l) =
     mconcat $ intersperse "\n∧ " (map pretty l)
+  pretty Bottom =
+    "⊥"
 
 instance Semigroup Constraint where
   (<>) = andConstr
@@ -58,9 +59,6 @@ andConstr :: Constraint -> Constraint -> Constraint
 andConstr Bottom _ = Bottom
 andConstr _ Bottom = Bottom
 andConstr (And l) (And m) = And (l ++ m)
-andConstr (And l) y = And (y : l)
-andConstr x (And m) = And (x : m)
-andConstr x y = And [x, y]
 
 -- | Solver monad for a specific solver, passed as a phantom type variable @s@ (refer to 'IsSolver' for more)
 --  to know the supported solvers. That's a phantom type variable used only to distinguish
@@ -107,39 +105,61 @@ solverPop = ask >>= liftIO . SimpleSMT.pop
 
 -- | Declare (name and type) all the variables of the environment in the SMT
 -- solver. This step is required before asserting constraints mentioning any of these variables.
-declareVariables :: (MonadIO m, MonadFail m) => M.Map String Type -> SolverT s m ()
+declareVariables :: (MonadIO m) => M.Map String Type -> ExceptT String (SolverT s m) ()
 declareVariables = mapM_ (uncurry declareVariable) . M.toList
 
 -- | Declares a single variable in the current solver session.
-declareVariable :: (MonadIO m, MonadFail m) => String -> Type -> SolverT s m ()
+declareVariable :: (MonadIO m) => String -> Type -> ExceptT String (SolverT s m) ()
 declareVariable varName varTy = do
   solver <- ask
-  ty <- lift $ translateType varTy
+  ty <- translateType varTy
   liftIO $ void $ SimpleSMT.declare solver (toSmtName varName) ty
 
 -- | Asserts a constraint; check 'Constraint' for more information
+-- | The functions 'assert' and 'assertNot' output a boolean,
+-- stating if the constraint was fully passed to the SMT solver,
+-- or if a part was lost during the translation process.
 assert ::
-  (MonadIO m, MonadFail m) =>
-  M.Map String Type ->
+  (MonadIO m) =>
   Constraint ->
-  SolverT s m ()
-assert gamma c = SolverT $ ReaderT $ \solver -> assertConstraintRaw solver gamma c
-  where
-    assertConstraintRaw :: (MonadIO m, MonadFail m)
-                        => SimpleSMT.Solver -> M.Map String Type -> Constraint -> m ()
-    assertConstraintRaw s env (name :== term) =
-      do
-        let smtName = toSmtName name
-        let (Just ty) = M.lookup name env
-        d <- translateTerm term
-        liftIO $ SimpleSMT.assert s (SimpleSMT.symbol smtName `SimpleSMT.eq` d)
-    assertConstraintRaw s _ (Eq term1 term2) = do
-      t1 <- translateTerm term1
-      t2 <- translateTerm term2
-      liftIO $ SimpleSMT.assert s (t1 `SimpleSMT.eq` t2)
-    assertConstraintRaw s env (And constraints) =
-      sequence_ (assertConstraintRaw s env <$> constraints)
-    assertConstraintRaw s _ Bottom = liftIO $ SimpleSMT.assert s (SimpleSMT.bool False)
+  SolverT s m Bool
+assert c =
+  SolverT $ ReaderT $ \solver -> do
+    (isTotal,expr) <- constraintToSExpr c
+    liftIO $ SimpleSMT.assert solver expr
+    return isTotal
+
+assertNot ::
+  (MonadIO m) =>
+  Constraint ->
+  SolverT s m Bool
+assertNot c =
+  SolverT $ ReaderT $ \solver -> do
+    (isTotal, expr) <- constraintToSExpr c
+    liftIO $ SimpleSMT.assert solver (SimpleSMT.not expr)
+    return isTotal
+
+atomicConstraintToSExpr :: Monad m
+                    => AtomicConstraint -> ExceptT String m SimpleSMT.SExpr
+atomicConstraintToSExpr (name :== term) =
+  do
+    let smtName = toSmtName name
+    d <- translateTerm term
+    return $ SimpleSMT.symbol smtName `SimpleSMT.eq` d
+atomicConstraintToSExpr (Eq term1 term2) = do
+  t1 <- translateTerm term1
+  t2 <- translateTerm term2
+  return $ t1 `SimpleSMT.eq` t2
+
+-- Since the translation of atomic constraints can fail,
+-- the translation of constraints does not always carry oll the information it could.
+-- So the boolean indicates if some atomic constraints have been forgotten during the translation.
+constraintToSExpr :: Monad m
+                    => Constraint -> m (Bool, SimpleSMT.SExpr)
+constraintToSExpr (And constraints) = do
+  atomTrads <- mapM (runExceptT . atomicConstraintToSExpr) constraints
+  return (all isRight atomTrads, SimpleSMT.andMany (rights atomTrads))
+constraintToSExpr Bottom = return (True, SimpleSMT.bool False)
 
 -- * Base defs
 
@@ -167,7 +187,7 @@ instance IsSolver CVC4_DBG where
 data CVC4
 
 instance IsSolver CVC4 where
-  launchSolver = cvc4_ALL_SUPPORTED False
+  launchSolver = cvc4_ALL_SUPPORTED True
 
 -- | Prepare a CVC4 solver with all supported theories, which is necessary
 -- to handle datatypes. The boolean parameter controls debug messages.
@@ -183,31 +203,31 @@ cvc4_ALL_SUPPORTED dbg = do
 
 -- * Translation of Terms
 
-translateTerm :: (MonadFail m) => Term Var -> m SimpleSMT.SExpr
-translateTerm (App var args) = mapM translateTerm args >>= translateVar var
+translateTerm :: (Monad m) => Term Var -> ExceptT String m SimpleSMT.SExpr
+translateTerm (App v args) = mapM translateTerm args >>= translateVar v
 translateTerm t@(Lam _ _) =
-  fail $ "Translate term to smtlib: Lambda abstraction in term: " ++ renderSingleLineStr (pretty t)
+  throwError $ "Translate term to smtlib: Lambda abstraction in term: " ++ renderSingleLineStr (pretty t)
 
-translateVar :: (MonadFail m) => Var -> [SimpleSMT.SExpr] -> m SimpleSMT.SExpr
+translateVar :: (Monad m) => Var -> [SimpleSMT.SExpr] -> ExceptT String m SimpleSMT.SExpr
 translateVar (Symb s) [] = return $ SimpleSMT.symbol $ toSmtName s
 translateVar (Free b) args = translateBuiltin b args
 translateVar (Literal l) [] = translateLit l
 translateVar v args =
-  fail $ "translateVar: unsupported: " ++ show v ++ " @ " ++ show args
+  throwError $ "translateVar: unsupported: " ++ show v ++ " @ " ++ show args
 
-translateLit :: (MonadFail m) => Lit -> m SimpleSMT.SExpr
+translateLit :: (Monad m) => Lit -> m SimpleSMT.SExpr
 translateLit (LitI i) = return $ SimpleSMT.int i
 translateLit (LitB i) = return $ SimpleSMT.bool i
 
-translateType :: (MonadFail m) => Type -> m SimpleSMT.SExpr
+translateType :: (Monad m) => Type -> ExceptT String m SimpleSMT.SExpr
 translateType TyInteger = return SimpleSMT.tInt
 translateType TyBool = return SimpleSMT.tBool
-translateType (TyFun _ _) = fail "tranlsateType: translating a TyFun"
+translateType (TyFun _ _) = throwError "tranlsateType: translating a TyFun"
 
-translateBuiltin :: (MonadFail m) => Builtin -> [SimpleSMT.SExpr] -> m SimpleSMT.SExpr
+translateBuiltin :: (Monad m) => Builtin -> [SimpleSMT.SExpr] -> ExceptT String m SimpleSMT.SExpr
 translateBuiltin BinAdd [x, y] = return $ SimpleSMT.add x y
 translateBuiltin BinSub [x, y] = return $ SimpleSMT.sub x y
 translateBuiltin BinLeq [x, y] = return $ SimpleSMT.leq x y
 translateBuiltin BinEq  [x, y] = return $ SimpleSMT.eq x y
 translateBuiltin BinIf  [x, y, z] = return $ SimpleSMT.ite x y z
-translateBuiltin b args = fail $ "translateBuiltin: wrong arity: " ++ show b ++ "@" ++ show args
+translateBuiltin b args = throwError $ "translateBuiltin: wrong arity: " ++ show b ++ "@" ++ show args
