@@ -27,19 +27,14 @@ litI :: Integer -> Term Var
 litI = flip App [] . Literal . LitI
 
 fib :: Term Var
-fib =
-  Lam TyInteger $
-    App (Free BinFix)
-      [ Lam (TyFun TyInteger TyInteger) $ Lam TyInteger $
-        let n = var $ Bound 0
-            f = Bound 1
-        in ite (n .== litI 0)
-                (litI 1)
-                (ite (n .== litI 1)
-                    (litI 1)
-                    (add (App f [sub n (litI 1)]) (App f [sub n (litI 2)]))),
-        var (Bound 0)
-      ]
+fib = fix $ Lam (TyFun TyInteger TyInteger) $ Lam TyInteger $
+  let n = var $ Bound 0
+      f = Bound 1
+   in ite (n .== litI 0)
+          (litI 1)
+          (ite (n .== litI 1)
+               (litI 1)
+               (add (App f [sub n (litI 1)]) (App f [sub n (litI 2)])))
 
 main :: IO ()
 main = do
